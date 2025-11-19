@@ -1,0 +1,140 @@
+name: Windows RDP via Tailscale (A)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gh_api_token:
+        description: "Optional override: GitHub Personal Access Token"
+        required: false
+      test_mode:
+        description: "Run 5-minute test loop"
+        type: boolean
+        default: false
+      runtime_minutes:
+        description: "Runtime in minutes (max 360; capped to 355)"
+        required: false
+        default: "355"
+      loops:
+        description: "How many handoffs (0 = infinite)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: playit-rdp-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  RDP_USER: runneradmin
+  RDP_PASS: ${{ secrets.PASS }}
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 370
+    steps:
+      - name: 🔧 Resolve inputs (safe)
+        id: cfg
+        env:
+          RAW_PAT:      ${{ inputs.gh_api_token }}
+          FALLBACK_PAT: ${{ secrets.TOKEN }}
+          RAW_TEST:     ${{ inputs.test_mode == true && 'true' || 'false' }}
+          RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
+          RAW_LOOPS:    ${{ inputs.loops || '0' }}
+        run: |
+          function ToIntOr($v, $def){ if("$v" -match '^\d+$'){[int]$v}else{[int]$def} }
+
+          $pat = $env:RAW_PAT
+          if (-not $pat) { $pat = $env:FALLBACK_PAT }
+          if (-not $pat) { Write-Error "Missing PAT (input and GH_PAT secret)"; exit 1 }
+
+          $isTest = ($env:RAW_TEST -match '^(?i:true|1|yes|on)$')
+
+          $runtime = ToIntOr $env:RAW_RUNTIME 355
+          if ($isTest) { $runtime = 5 }
+
+          if (-not $isTest -and $runtime -lt 6) { $runtime = 355 }
+          if ($runtime -gt 360) { $runtime = 355 }
+
+          $loops = ToIntOr $env:RAW_LOOPS 0
+          if ($loops -lt 0) { $loops = 0 }
+
+          "pat=$pat"         | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
+          "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "Resolved: test=$isTest, runtime=$runtime, loops=$loops"
+
+      - name: 🔐 Enable RDP user + firewall
+        run: |
+          $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      - name: 📥 Download Playit.gg
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/playit-cloud/playit-agent/releases/download/v0.15.26/playit-windows-x86_64-signed.exe" -OutFile "$env:USERPROFILE\playit.exe"
+          Start-Sleep -Seconds 5
+
+      - name: 🚀 Start Playit RDP Tunnel (safe)
+        env:
+          PLAYIT_AUTH_KEY: ${{ secrets.PL }}
+        run: |
+          $exe = "$env:USERPROFILE\playit.exe"
+
+          # Ensure Playit client exists
+          if (-not (Test-Path $exe)) {
+              Invoke-WebRequest -Uri "https://github.com/playit-cloud/playit-agent/releases/download/v0.15.26/playit-windows-x86_64-signed.exe" -OutFile $exe -UseBasicParsing
+          }
+
+          # Start Playit in background (non-blocking)
+          Start-Process -FilePath $exe -ArgumentList "--secret $env:PLAYIT_AUTH_KEY" -NoNewWindow
+          Start-Sleep -Seconds 10
+          Write-Host "Playit tunnel started and running in background."
+
+          # Keep-alive/logging loop
+          $runtime = [int]("${{ steps.cfg.outputs.runtime }}")
+          $end = (Get-Date).AddMinutes($runtime)
+          while ((Get-Date) -lt $end) {
+              $left = [math]::Ceiling(($end - (Get-Date)).TotalMinutes)
+              Write-Host "RDP alive... ($left min left)"
+              Start-Sleep -Seconds 60
+          }
+
+      - name: 🔁 Dispatch workflow B
+        if: always()
+        run: |
+          $loops = [int]"${{ steps.cfg.outputs.loops }}"
+          if ($loops -eq 1) { Write-Host "Loops finished; not dispatching."; exit 0 }
+          if ($loops -gt 1) { $next = $loops - 1 } else { $next = 0 }
+
+          $token = "${{ steps.cfg.outputs.pat }}"
+          $body = @{
+              ref    = "${{ github.ref_name }}"
+              inputs = @{
+                  gh_api_token    = "$token"
+                  test_mode       = "false"
+                  runtime_minutes = "${{ steps.cfg.outputs.runtime }}"
+                  loops           = "$next"
+              }
+          } | ConvertTo-Json -Depth 5
+
+          Invoke-RestMethod -Method POST `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" `
+            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
+            -Body $body
